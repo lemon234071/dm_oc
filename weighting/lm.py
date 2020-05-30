@@ -1,37 +1,53 @@
-from transformers import GPT2Tokenizer
-from transformers import GPT2LMHeadModel
-
-from tqdm import tqdm
+import os
+import sys
+import time
 import math
+import logging
+from tqdm import tqdm
 
 import torch
 from torch import nn
 from torch import optim
+from tensorboardX import SummaryWriter
+from transformers import GPT2Tokenizer, GPT2LMHeadModel, GPT2Config, CONFIG_NAME, AdamW
 
-from torch.utils.data import DataLoader, TensorDataset
 from data_utils.data_processors import InputFeatures
+from data_utils.inputter import build_dataloader
+from data_utils.data_process import build_personachat
+from weighting.optim import warmup_linear, noam_decay, noamwd_decay, exponential_decay
 
 from magic_module import MagicModule
 
+logger = logging.getLogger(__file__)
 
-BERT_MODEL = 'gpt2'
-MAX_SEQ_LENGTH = 64
+# MAX_SEQ_LENGTH = 64
 EPSILON = 1e-5
 
 
-class Classifier:
-    def __init__(self, label_list, ren, norm_fn, device):
-        self._label_list = label_list
+class LMManager:
+    def __init__(self, args, pretrained, model_checkpoint, report_every,
+                 ren, norm_fn, device, save_dir="checkpoints", logdir=None):
+        self.args = args
         self._ren = ren
         self._device = device
 
-        self._tokenizer = GPT2Tokenizer.from_pretrained(
-            BERT_MODEL, do_lower_case=True)
+        self.tokenizer = GPT2Tokenizer.from_pretrained(
+            model_checkpoint, do_lower_case=True)
+        self.pad_id = 0
+
+        self._config = GPT2Config.from_json_file(os.path.join(model_checkpoint, CONFIG_NAME))
 
         self._model = GPT2LMHeadModel.from_pretrained(
-            BERT_MODEL, num_labels=len(label_list)).to(device)
+            model_checkpoint).to(device) if pretrained else GPT2LMHeadModel(self._config).to(device)
+        self.save_dir = save_dir
 
         self._optimizer = None
+        self.writer = SummaryWriter(logdir=logdir)
+        self.report_every = report_every
+        self.batch_step = 0
+        self.training_step = 1
+        self.gradient_accumulation_steps = args.gradient_accumulation_steps
+        self.max_val_step = args.max_val_step
 
         self._dataset = {}
         self._data_loader = {}
@@ -47,23 +63,23 @@ class Classifier:
         if ren:
             assert norm_fn == 'linear'
 
-    def init_weights(self, n_examples, w_init, w_decay):
+    def init_weights(self, w_init, w_decay):
         if self._ren:
             raise ValueError(
                 'no global weighting initialization when \'ren\'=True')
 
         self._weights = torch.tensor(
-            [w_init] * n_examples, requires_grad=True).to(device=self._device)
+            [w_init] * len(self._dataset['train']['all_ids']), requires_grad=True).to(device=self._device)
         self._w_decay = w_decay
 
     def load_data(self, set_type, examples, batch_size, shuffle):
-        self._dataset[set_type] = examples
-        self._data_loader[set_type] = _make_data_loader(
-            examples=examples,
-            label_list=self._label_list,
-            tokenizer=self._tokenizer,
+        self._dataset[set_type] = build_personachat(examples, self.tokenizer)
+        self._data_loader[set_type] = build_dataloader(
+            self._dataset[set_type],
             batch_size=batch_size,
-            shuffle=shuffle)
+            shuffle=shuffle,
+            pad_id=self.pad_id,
+            batch_first=True)
 
     def get_optimizer(self, learning_rate):
         self._optimizer = _get_optimizer(
@@ -72,41 +88,69 @@ class Classifier:
     def pretrain_epoch(self):
         self._model.train()
 
+        start_t = time.time()
         for step, batch in enumerate(tqdm(self._data_loader['train'],
                                           desc='Pre-training')):
             batch = tuple(t.to(self._device) for t in batch)
-            input_ids, input_mask, segment_ids, label_ids, _ = batch
+            input_ids, segment_ids, label_ids, _ = batch
 
-            self._optimizer.zero_grad()
-            loss = self._model(input_ids, segment_ids, input_mask, label_ids)
+            (loss), *_ = self._model(input_ids, token_type_ids=segment_ids, labels=label_ids)
+            loss = loss / self.gradient_accumulation_steps
             loss.backward()
-            self._optimizer.step()
+            torch.nn.utils.clip_grad_norm_(self._model.parameters(), self.args.max_norm)
+            self.batch_step += 1
+            if self.batch_step % self.gradient_accumulation_steps == 0:
+                _set_lr(self._optimizer, self.training_step,
+                        self.args.lr_schedule, self.args.learning_rate,
+                        self.args.warmup_steps, self.args.warmup_proportion,
+                        self._config.n_embd, self.args.num_optim_steps)
+
+                self._optimizer.step()
+                self._optimizer.zero_grad()
+                self.training_step += 1
+                if self.training_step % self.report_every == 0:
+                    self._stat(loss * self.gradient_accumulation_steps, start_t)
 
     def train_epoch(self):
         self._model.train()
 
+        start_t = time.time()
+        criterion = nn.CrossEntropyLoss(reduction='none', ignore_index=-1)
         for step, batch in enumerate(tqdm(self._data_loader['train'],
-                                          desc='Training')):
+                                          desc='Training', mininterval=1)):
+            weights = self._get_weights(batch)
+            weights = self._norm_fn(weights)
             batch = tuple(t.to(self._device) for t in batch)
-            input_ids, input_mask, segment_ids, label_ids, _ = batch
+            input_ids, token_type_ids, label_ids, _ = batch
 
-            batch_size = batch[-1].shape[0]
-            weights = []
-            for i in range(0, batch_size, 8):
-                lil_batch = tuple(t[i:i+8] for t in batch)
-                weights.append(self._get_weights(lil_batch))
-            weights = self._norm_fn(torch.cat(weights, dim=0))
-
-            self._optimizer.zero_grad()
-            criterion = nn.CrossEntropyLoss(reduction='none')
-            logits = self._model(input_ids, segment_ids, input_mask)
-            loss = criterion(logits, label_ids)
-            loss = torch.sum(loss * weights.data)
+            logits, *_ = self._model(input_ids, token_type_ids=token_type_ids)
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = label_ids[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_original = criterion(shift_logits.view(-1, shift_logits.size(-1)),
+                                      shift_labels.view(-1))
+            loss = torch.sum(loss_original.view(shift_labels.shape) * weights.data.unsqueeze(1))
+            loss = loss / self.gradient_accumulation_steps
             loss.backward()
-            self._optimizer.step()
+            torch.nn.utils.clip_grad_norm_(self._model.parameters(), self.args.max_norm)
+            self.batch_step += 1
+
+            if self.batch_step % self.gradient_accumulation_steps == 0:
+                _set_lr(self._optimizer, self.training_step,
+                        self.args.lr_schedule, self.args.learning_rate,
+                        self.args.warmup_steps, self.args.warmup_proportion,
+                        self._config.n_embd, self.args.num_optim_steps)
+
+                self._optimizer.step()
+                self._optimizer.zero_grad()
+                self.training_step += 1
+                if self.training_step % self.report_every == 0:
+                    non_padding = shift_labels.ne(-1).sum().item()
+                    self._stat(loss_original.sum() / non_padding, start_t)
 
     def _get_weights(self, batch):
-        input_ids, input_mask, segment_ids, label_ids, ids = batch
+        batch = tuple(t.to(self._device) for t in batch)
+        input_ids, segment_ids, label_ids, ids = batch
         batch_size = label_ids.shape[0]
 
         optimizer_initialized = ('exp_avg' in self._optimizer.state[
@@ -121,36 +165,52 @@ class Classifier:
             weights = self._weights[ids]
 
         magic_model = MagicModule(self._model)
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(ignore_index=-1)
 
         for i in range(batch_size):
+            # compute grads L_theta
             self._model.zero_grad()
-            logits = self._model(
-                input_ids[i:i + 1], segment_ids[i:i + 1], input_mask[i:i + 1])
-            loss = criterion(logits, label_ids[i:i + 1])
+            # TODO(yida) why here compute loss outside the model ?
+            # (loss), *_ = self._model(
+            #     input_ids[i:i + 1], token_type_ids=segment_ids[i:i + 1], labels=label_ids[i:i + 1])
+            logits, *_ = self._model(
+                input_ids[i:i + 1], token_type_ids=segment_ids[i:i + 1])
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = label_ids[i:i + 1][..., 1:].contiguous()
+            # Flatten the tokens
+            loss = criterion(shift_logits.view(-1, shift_logits.size(-1)),
+                             shift_labels.view(-1))
 
             grads = torch.autograd.grad(
                 loss, [param for name, param in self._model.named_parameters()])
             grads = {param: grads[j] for j, (name, param) in enumerate(
                 self._model.named_parameters())}
 
+            # theta'(phi) = theta + grads
             deltas = _adam_delta(self._optimizer, self._model, grads)
             deltas = {name: weights[i] * delta.data for name, delta in
                       deltas.items()}
             magic_model.update_params(deltas)
+        batch = tuple(t.cpu() for t in batch)
 
+        # get grad of phi with dev
         weights_grad_list = []
-        for step, val_batch in enumerate(self._data_loader['dev']):
+        for step, val_batch in enumerate(self._data_loader['dev_shuffle']):
+            if step > self.max_val_step:
+                break
+
             val_batch = (t.to(self._device) for t in val_batch)
-            val_input_ids, val_input_mask, val_segment_ids, val_label_ids, _ = \
+            val_input_ids, val_segment_ids, val_label_ids, _ = \
                 val_batch
             val_batch_size = val_label_ids.shape[0]
 
-            val_loss = magic_model(
-                val_input_ids, val_segment_ids, val_input_mask, val_label_ids)
+            # L(theta'(phi))
+            (val_loss), *_ = magic_model(
+                val_input_ids, token_type_ids=val_segment_ids, labels=val_label_ids)
             val_loss = val_loss * \
                        float(val_batch_size) / float(len(self._dataset['dev']))
 
+            # delta L(theta'(phi))
             weights_grad = torch.autograd.grad(
                 val_loss, weights, retain_graph=True)[0]
             weights_grad_list.append(weights_grad)
@@ -160,6 +220,7 @@ class Classifier:
         if self._ren:
             return -weights_grad
         else:
+            # update phi according grad of phi
             self._weights[ids] = weights.data / self._w_decay - weights_grad
             self._weights[ids] = torch.max(self._weights[ids], torch.ones_like(
                 self._weights[ids]).fill_(EPSILON))
@@ -169,30 +230,85 @@ class Classifier:
     def evaluate(self, set_type):
         self._model.eval()
 
-        preds_all, labels_all = [], []
+        total_loss, non_padding = 0., 0.
         data_loader = self._data_loader[set_type]
 
+        criterion = nn.CrossEntropyLoss(reduction='sum', ignore_index=-1)
         for batch in tqdm(data_loader,
                           desc="Evaluating {} set".format(set_type)):
             batch = tuple(t.to(self._device) for t in batch)
-            input_ids, input_mask, segment_ids, label_ids = batch[:4]
+            input_ids, segment_ids, label_ids = batch[:3]
 
             with torch.no_grad():
-                logits = self._model(input_ids, segment_ids, input_mask)
-            preds = torch.argmax(logits, dim=1)
+                logits, *_ = self._model(input_ids, token_type_ids=segment_ids)
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = label_ids[..., 1:].contiguous()
+                # Flatten the tokens
+                loss = criterion(shift_logits.view(-1, shift_logits.size(-1)),
+                                 shift_labels.view(-1))
+                total_loss += loss.item()
+                non_padding += shift_labels.ne(-1).sum().item()
+        self._stat(total_loss / non_padding, 0, mode="valid")
+        return math.exp(min(total_loss / non_padding, 100))
 
-            preds_all.append(preds)
-            labels_all.append(label_ids)
+    def infer(self, set_type, outpath):
+        self._model.eval()
 
-        preds_all = torch.cat(preds_all, dim=0)
-        labels_all = torch.cat(labels_all, dim=0)
+        total_loss, non_padding = 0., 0.
+        data_loader = self._data_loader[set_type]
 
-        return torch.sum(preds_all == labels_all).item() / labels_all.shape[0]
+        predictions = []
+        for batch in tqdm(data_loader,
+                          desc="Inferring {} set".format(set_type)):
+            batch = tuple(t.to(self._device) for t in batch)
+            input_ids, segment_ids, label_ids = batch[:3]
+            with torch.no_grad():
+                logits, *_ = self._model(input_ids, token_type_ids=segment_ids)
+
+        self._stat(total_loss / non_padding, 0, mode="infer")
+
+    def save(self):
+        if not os.path.exists(self.save_dir):
+            os.mkdir(self.save_dir)
+        torch.save(
+            {k: (v.cpu() if v is not None else None)  # save to cpu tensors
+             for k, v in self._model.state_dict().items()},
+            os.path.join(self.save_dir, "pytorch_model_{}.bin".format(self.training_step)))
+        if not os.path.exists(os.path.join(self.save_dir, CONFIG_NAME)):
+            getattr(self._model, 'module', self._model).config.to_json_file(
+                os.path.join(self.save_dir, CONFIG_NAME))
+            self.tokenizer.save_vocabulary(self.save_dir)
+
+        checkpoint = {
+            "weights": self._weights,
+            "args": self.args,
+            "optim": self._optimizer.state_dict()
+        }
+        torch.save(
+            checkpoint,
+            os.path.join(self.save_dir, "checkpoint_{}.bin".format(self.training_step)))
+
+    def _stat(self, loss, start, mode="training"):
+        if mode == "training":
+            logger.info(
+                ("Optimizer step %s; ppl: %5.2f; loss: %4.2f; lr: %7.5f; %6.0f sec")
+                % (self.training_step,
+                   math.exp(min(loss, 100)),
+                   loss,
+                   self._optimizer.param_groups[0]['lr'],
+                   time.time() - start))
+            self.writer.add_scalars("train_loss", {"loss_batch": loss}, self.training_step)
+        else:
+            logger.info(
+                ("Validation: ppl: %5.2f; loss: %4.2f") % (math.exp(min(loss, 100)), loss))
+            self.writer.add_scalars("valid_loss", {"loss": loss}, self.training_step)
+        sys.stdout.flush()
 
 
 def _get_optimizer(model, learning_rate):
     param_optimizer = list(model.named_parameters())
-    no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+    no_decay = ['bias', 'ln']
+    # no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
     optimizer_grouped_parameters = [
         {'params': [p for n, p in param_optimizer if
                     not any(nd in n for nd in no_decay)], 'weight_decay': 0.01},
@@ -202,27 +318,22 @@ def _get_optimizer(model, learning_rate):
     return optim.Adam(optimizer_grouped_parameters, lr=learning_rate)
 
 
-def _make_data_loader(examples, label_list, tokenizer, batch_size, shuffle):
-    all_features = _convert_examples_to_features(
-        examples=examples,
-        label_list=label_list,
-        max_seq_length=MAX_SEQ_LENGTH,
-        tokenizer=tokenizer,
-        output_mode='classification')
-
-    all_input_ids = torch.tensor(
-        [f.input_ids for f in all_features], dtype=torch.long)
-    all_input_mask = torch.tensor(
-        [f.input_mask for f in all_features], dtype=torch.long)
-    all_segment_ids = torch.tensor(
-        [f.segment_ids for f in all_features], dtype=torch.long)
-    all_label_ids = torch.tensor(
-        [f.label_id for f in all_features], dtype=torch.long)
-    all_ids = torch.arange(len(examples))
-
-    dataset = TensorDataset(
-        all_input_ids, all_input_mask, all_segment_ids, all_label_ids, all_ids)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+def _set_lr(optimizer, step, schedule, lr,
+            warmup_steps, warmup_proportion, n_embd, tot_steps,
+            rate=0.5, decay_steps=10000, start_step=50000):
+    if schedule == 'None':
+        lr_this_step = lr
+    elif schedule == 'noam':  # transformer like
+        lr_this_step = lr * 1e4 * noam_decay(step + 1, warmup_steps, n_embd)
+    elif schedule == 'noamwd':  # transformer like
+        lr_this_step = lr * 1e4 * noamwd_decay(step + 1, warmup_steps, n_embd)
+    elif schedule == 'exp':
+        lr_this_step = lr * exponential_decay(step, rate, decay_steps, start_step)
+    else:
+        lr_this_step = lr * warmup_linear(step / tot_steps,
+                                          warmup_proportion)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr_this_step
 
 
 def _linear_normalize(weights):
@@ -237,7 +348,7 @@ def _softmax_normalize(weights):
 
 
 def _convert_examples_to_features(examples, label_list, max_seq_length,
-                                 tokenizer, output_mode):
+                                  tokenizer, output_mode):
     """Loads a data file into a list of `InputBatch`s."""
 
     label_map = {label: i for i, label in enumerate(label_list)}
@@ -289,10 +400,10 @@ def _convert_examples_to_features(examples, label_list, max_seq_length,
             raise KeyError(output_mode)
 
         features.append(
-                InputFeatures(input_ids=input_ids,
-                              input_mask=input_mask,
-                              segment_ids=segment_ids,
-                              label_id=label_id))
+            InputFeatures(input_ids=input_ids,
+                          input_mask=input_mask,
+                          segment_ids=segment_ids,
+                          label_id=label_id))
 
     return features
 
