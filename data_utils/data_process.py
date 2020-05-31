@@ -18,7 +18,7 @@ MAX_HISTORY = 15
 def get_data(tokenizer, dataset_path, dataset_cache, dataset_name):
     """ Get tokenized dataset from URL or cache."""
     dataset_path = dataset_path or DATASETS_URL[dataset_name]
-    dataset_cache = dataset_cache + '_' + type(tokenizer).__name__
+    dataset_cache = dataset_cache + '_' + dataset_name + '_' + type(tokenizer).__name__
     if dataset_cache and os.path.isfile(dataset_cache):
         logger.info("Load tokenized dataset from cache at %s", dataset_cache)
         dataset = torch.load(dataset_cache)
@@ -39,6 +39,44 @@ def get_data(tokenizer, dataset_path, dataset_cache, dataset_name):
 
         dataset = tokenize(dataset)
         torch.save(dataset, dataset_cache)
+    return dataset
+
+
+def build_from_json(data, tokenizer, max_len):
+    eos = tokenizer.eos_token_id
+    dataset = collections.defaultdict(list)
+
+    for session in data:
+        sequence = [s + [eos] for s in session]
+        while not sum([len(seq) for seq in sequence]) < max_len:
+            if len(sequence) > 2:
+                sequence = sequence[1:]
+            else:
+                break
+        dataset["input_ids_pad"].append(list(chain(*sequence)))
+        dataset["token_type_ids_pad"].append([j for i, s in enumerate(sequence) for j in [i] * len(s)])
+        dataset["lm_labels_pad"].append(([-1] * sum(len(s) for s in sequence[:-1])) + sequence[-1])
+        # assert len(dataset["input_ids_pad"][-1]) == len(dataset["token_type_ids_pad"][-1]) == len(
+        #    dataset["lm_labels_pad"][-1])
+    dataset["all_ids"] = [i for i in range(len(dataset["lm_labels_pad"]))]
+    return dataset
+
+
+def build_one_json(session, eos, max_len):
+    dataset = collections.defaultdict(list)
+
+    session = [s + [eos] for s in session[:-1]] + [session[-1]]
+    while not sum([len(seq) for seq in session]) < max_len:
+        if len(session) > 2:
+            session = session[1:]
+        else:
+            break
+    dataset["input_ids_pad"].append(list(chain(*session)))
+    dataset["token_type_ids_pad"].append([j for i, s in enumerate(session) for j in [i] * len(s)])
+    #dataset["lm_labels_pad"].append(([-1] * sum(len(s) for s in sequence[:-1])) + sequence[-1])
+    # assert len(dataset["input_ids_pad"][-1]) == len(dataset["token_type_ids_pad"][-1]) == len(
+    #    dataset["lm_labels_pad"][-1])
+    # dataset["all_ids"] = [i for i in range(len(dataset["lm_labels_pad"]))]
     return dataset
 
 

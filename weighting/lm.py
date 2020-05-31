@@ -3,6 +3,7 @@ import sys
 import time
 import math
 import logging
+import datetime
 from tqdm import tqdm
 
 import torch
@@ -10,11 +11,13 @@ from torch import nn
 from torch import optim
 from tensorboardX import SummaryWriter
 from transformers import GPT2Tokenizer, GPT2LMHeadModel, GPT2Config, CONFIG_NAME, AdamW
+from nltk.translate.bleu_score import corpus_bleu, SmoothingFunction
 
-from data_utils.data_processors import InputFeatures
 from data_utils.inputter import build_dataloader
-from data_utils.data_process import build_personachat
+from data_utils.data_process import build_from_json, build_one_json
 from weighting.optim import warmup_linear, noam_decay, noamwd_decay, exponential_decay
+from weighting.decode_utils import *
+from weighting.eval_utils import *
 
 from magic_module import MagicModule
 
@@ -26,7 +29,7 @@ EPSILON = 1e-5
 
 class LMManager:
     def __init__(self, args, pretrained, model_checkpoint, report_every,
-                 ren, norm_fn, device, save_dir="checkpoints", logdir=None):
+                 ren, norm_fn, device, logdir=None):
         self.args = args
         self._ren = ren
         self._device = device
@@ -36,10 +39,20 @@ class LMManager:
         self.pad_id = 0
 
         self._config = GPT2Config.from_json_file(os.path.join(model_checkpoint, CONFIG_NAME))
+        self._max_len = 256  # 512  # self._config.n_ctx
 
         self._model = GPT2LMHeadModel.from_pretrained(
             model_checkpoint).to(device) if pretrained else GPT2LMHeadModel(self._config).to(device)
-        self.save_dir = save_dir
+        num_param, _, __ = _tally_parameters(self._model)
+        logger.info("model paramerters: {}".format(num_param))
+
+        if not os.path.exists("checkpoints"):
+            os.mkdir("checkpoints")
+        self.save_dir = os.path.join("checkpoints", args.save_dir)
+        if not os.path.exists(self.save_dir):
+            os.mkdir(self.save_dir)
+        elif args.infer_from == "":
+            raise Exception("path exists {}".format(self.save_dir))
 
         self._optimizer = None
         self.writer = SummaryWriter(logdir=logdir)
@@ -73,7 +86,7 @@ class LMManager:
         self._w_decay = w_decay
 
     def load_data(self, set_type, examples, batch_size, shuffle):
-        self._dataset[set_type] = build_personachat(examples, self.tokenizer)
+        self._dataset[set_type] = build_from_json(examples, self.tokenizer, self._max_len)
         self._data_loader[set_type] = build_dataloader(
             self._dataset[set_type],
             batch_size=batch_size,
@@ -164,6 +177,8 @@ class LMManager:
         else:
             weights = self._weights[ids]
 
+        import pdb;
+        pdb.set_trace()
         magic_model = MagicModule(self._model)
         criterion = nn.CrossEntropyLoss(ignore_index=-1)
 
@@ -251,25 +266,7 @@ class LMManager:
         self._stat(total_loss / non_padding, 0, mode="valid")
         return math.exp(min(total_loss / non_padding, 100))
 
-    def infer(self, set_type, outpath):
-        self._model.eval()
-
-        total_loss, non_padding = 0., 0.
-        data_loader = self._data_loader[set_type]
-
-        predictions = []
-        for batch in tqdm(data_loader,
-                          desc="Inferring {} set".format(set_type)):
-            batch = tuple(t.to(self._device) for t in batch)
-            input_ids, segment_ids, label_ids = batch[:3]
-            with torch.no_grad():
-                logits, *_ = self._model(input_ids, token_type_ids=segment_ids)
-
-        self._stat(total_loss / non_padding, 0, mode="infer")
-
     def save(self):
-        if not os.path.exists(self.save_dir):
-            os.mkdir(self.save_dir)
         torch.save(
             {k: (v.cpu() if v is not None else None)  # save to cpu tensors
              for k, v in self._model.state_dict().items()},
@@ -303,6 +300,87 @@ class LMManager:
                 ("Validation: ppl: %5.2f; loss: %4.2f") % (math.exp(min(loss, 100)), loss))
             self.writer.add_scalars("valid_loss", {"loss": loss}, self.training_step)
         sys.stdout.flush()
+
+    def infer(self, data, outpath, has_gt=True):
+        self._model.eval()
+
+        predictions = []
+        for session in tqdm(data, desc="Inferring test set"):
+            with torch.no_grad():
+                out_ids = self.sample_sequence(session, has_gt)
+                out_text = self.tokenizer.decode(out_ids, skip_special_tokens=True)
+                predictions.append(out_text)
+
+        with open(outpath, 'w', encoding="UTF-8") as f:
+            f.write("\n".join(predictions))
+
+        gt = [session[-1] for session in data] if has_gt else None
+        self._eval(predictions, gt)
+
+    def sample_sequence(self, session, has_gt, current_output=None):
+        if has_gt:
+            session = session[:-1]
+        if current_output is None:
+            current_output = []
+
+        for i in range(self.args.max_length):
+            session.append(current_output)
+            instance = build_one_json(session, self.tokenizer.eos_token_id, self._max_len)
+            input_ids = torch.tensor(instance["input_ids_pad"],
+                                     dtype=torch.long, device=self._device)
+            token_type_ids = torch.tensor(instance["token_type_ids_pad"],
+                                          dtype=torch.long, device=self._device)
+            logits, *_ = self._model(input_ids, token_type_ids=token_type_ids)
+            logits = logits[0, -1, :] / self.args.temperature
+            logits = top_filtering(logits, top_k=self.args.top_k, top_p=self.args.top_p)
+            probs = F.softmax(logits, dim=-1)
+
+            prev = torch.multinomial(probs, 1)
+            if i < self.args.min_length and prev.item() == self.tokenizer.eos_token_id:
+                while prev.item() == self.tokenizer.eos_token_id:
+                    prev = torch.multinomial(probs, num_samples=1)
+
+            if prev.item() == self.tokenizer.eos_token_id:
+                break
+            current_output.append(prev.item())
+
+        return current_output
+
+    def _eval(self, hypts, refs):
+        hypts = [line.strip().split() for line in hypts]
+        distinct = [round(x, 4) for x in eval_distinct(hypts)]
+        logger.info('distinct: {}'.format(distinct))
+        if refs is not None:
+            refs = [[line.strip().split()] for line in refs]
+            gold_distinct = [round(x, 4) for x in eval_distinct([x[0] for x in refs])]
+            logger.info('gt distinct: {}'.format(gold_distinct))
+            nltk_bleu = []
+            chencherry = SmoothingFunction()
+            for i in range(4):
+                weights = [1 / (i + 1)] * (i + 1)
+                nltk_bleu.append(
+                    round(corpus_bleu(
+                        refs, hypts, weights=weights, smoothing_function=chencherry.method1), 4))
+            logger.info('nltk BLEU: {}'.format(nltk_bleu))
+
+    def infer_batch(self, data, outpath):
+        self._model.eval()
+
+        predictions = []
+        for batch in tqdm(data_loader,
+                          desc="Inferring {} set".format(set_type)):
+            batch = tuple(t.to(self._device) for t in batch)
+            input_ids, segment_ids, label_ids = batch[:3]
+            batch_size = label_ids.shape[0]
+            with torch.no_grad():
+                for i in range(batch_size):
+                    inputs = (input_ids[i:i + 1], segment_ids[i:i + 1])
+                    out_ids = self.sample_sequence(inputs)
+                    out_text = self.tokenizer.decode(out_ids, skip_special_tokens=True)
+                    predictions.append(out_text)
+
+        with open(outpath, 'w', encoding="UTF-8") as f:
+            f.write("\n".join(predictions))
 
 
 def _get_optimizer(model, learning_rate):
@@ -347,85 +425,6 @@ def _softmax_normalize(weights):
     return nn.functional.softmax(weights, dim=0)
 
 
-def _convert_examples_to_features(examples, label_list, max_seq_length,
-                                  tokenizer, output_mode):
-    """Loads a data file into a list of `InputBatch`s."""
-
-    label_map = {label: i for i, label in enumerate(label_list)}
-
-    features = []
-    for (ex_index, example) in enumerate(examples):
-        tokens_a = tokenizer.tokenize(example.text_a)
-
-        tokens_b = None
-        if example.text_b:
-            tokens_b = tokenizer.tokenize(example.text_b)
-            # Modifies `tokens_a` and `tokens_b` in place so that the total
-            # length is less than the specified length.
-            # Account for [CLS], [SEP], [SEP] with "- 3"
-            _truncate_seq_pair(tokens_a, tokens_b, max_seq_length - 3)
-        else:
-            # Account for [CLS] and [SEP] with "- 2"
-            if len(tokens_a) > max_seq_length - 2:
-                tokens_a = tokens_a[:(max_seq_length - 2)]
-
-        tokens = ["[CLS]"] + tokens_a + ["[SEP]"]
-        segment_ids = [0] * len(tokens)
-
-        if tokens_b:
-            tokens += tokens_b + ["[SEP]"]
-            segment_ids += [1] * (len(tokens_b) + 1)
-
-        input_ids = tokenizer.convert_tokens_to_ids(tokens)
-
-        # The mask has 1 for real tokens and 0 for padding tokens. Only real
-        # tokens are attended to.
-        input_mask = [1] * len(input_ids)
-
-        # Zero-pad up to the sequence length.
-        padding = [0] * (max_seq_length - len(input_ids))
-        input_ids += padding
-        input_mask += padding
-        segment_ids += padding
-
-        assert len(input_ids) == max_seq_length
-        assert len(input_mask) == max_seq_length
-        assert len(segment_ids) == max_seq_length
-
-        if output_mode == "classification":
-            label_id = label_map[example.label]
-        elif output_mode == "regression":
-            label_id = float(example.label)
-        else:
-            raise KeyError(output_mode)
-
-        features.append(
-            InputFeatures(input_ids=input_ids,
-                          input_mask=input_mask,
-                          segment_ids=segment_ids,
-                          label_id=label_id))
-
-    return features
-
-
-def _truncate_seq_pair(tokens_a, tokens_b, max_length):
-    """Truncates a sequence pair in place to the maximum length."""
-
-    # This is a simple heuristic which will always truncate the longer sequence
-    # one token at a time. This makes more sense than truncating an equal
-    # percent of tokens from each, since if one sequence is very short then each
-    # token that's truncated likely contains more information than a longer
-    # sequence.
-    while True:
-        total_length = len(tokens_a) + len(tokens_b)
-        if total_length <= max_length:
-            break
-        if len(tokens_a) > len(tokens_b):
-            tokens_a.pop()
-        else:
-            tokens_b.pop()
-
-
 def _adam_delta(optimizer, model, grads):
     deltas = {}
     for group in optimizer.param_groups:
@@ -455,3 +454,14 @@ def _adam_delta(optimizer, model, grads):
     param_to_name = {param: name for name, param in model.named_parameters()}
 
     return {param_to_name[param]: delta for param, delta in deltas.items()}
+
+
+def _tally_parameters(model):
+    enc = 0
+    dec = 0
+    for name, param in model.named_parameters():
+        if 'encoder' in name:
+            enc += param.nelement()
+        else:
+            dec += param.nelement()
+    return enc + dec, enc, dec
