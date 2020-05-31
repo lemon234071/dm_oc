@@ -177,8 +177,6 @@ class LMManager:
         else:
             weights = self._weights[ids]
 
-        import pdb;
-        pdb.set_trace()
         magic_model = MagicModule(self._model)
         criterion = nn.CrossEntropyLoss(ignore_index=-1)
 
