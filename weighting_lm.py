@@ -18,8 +18,8 @@ def setup_seed(seed):
 
 setup_seed(2020)
 logging.basicConfig(level=logging.INFO, format='\n %(asctime)s - %(levelname)s - %(message)s')  # - %(name)s
-# device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-device = torch.device('cpu')
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# device = torch.device('cpu')
 print('device:', device)
 
 # torch.backends.cudnn.enabled = True

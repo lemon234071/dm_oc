@@ -4,6 +4,7 @@ import time
 import math
 import logging
 import datetime
+import platform
 from tqdm import tqdm
 
 import torch
@@ -25,7 +26,7 @@ logger = logging.getLogger(__file__)
 
 # MAX_SEQ_LENGTH = 64
 EPSILON = 1e-5
-
+SYS = platform.system()
 
 class LMManager:
     def __init__(self, args, pretrained, model_checkpoint, report_every,
@@ -36,7 +37,7 @@ class LMManager:
 
         self.tokenizer = GPT2Tokenizer.from_pretrained(
             model_checkpoint, do_lower_case=True)
-        self.pad_id = 0
+        self.pad_id = self.tokenizer.eos_token_id
 
         self._config = GPT2Config.from_json_file(os.path.join(model_checkpoint, CONFIG_NAME))
         self._max_len = 256  # 512  # self._config.n_ctx
@@ -52,7 +53,8 @@ class LMManager:
         if not os.path.exists(self.save_dir):
             os.mkdir(self.save_dir)
         elif args.infer_from == "":
-            raise Exception("path exists {}".format(self.save_dir))
+            if SYS != "Windows":
+                raise Exception("path exists {}".format(self.save_dir))
 
         self._optimizer = None
         self.writer = SummaryWriter(logdir=logdir)
@@ -253,7 +255,7 @@ class LMManager:
                 total_loss += loss.item()
                 total_non_padding += non_padding
 
-        self._stat(total_loss / non_padding, 0, mode=set_type)
+        self._stat(total_loss / total_non_padding, 0, mode=set_type)
         return math.exp(min(total_loss / total_non_padding, 100))
 
     def save(self, epoch):
