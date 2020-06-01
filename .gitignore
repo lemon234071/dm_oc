@@ -3,3 +3,4 @@ pytorch_models
 data
 dataset_cache*
 checkpoint
+result*

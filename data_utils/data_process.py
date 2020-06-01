@@ -54,7 +54,8 @@ def build_from_json(data, tokenizer, max_len):
             else:
                 break
         dataset["input_ids_pad"].append(list(chain(*sequence)))
-        dataset["token_type_ids_pad"].append([j for i, s in enumerate(sequence) for j in [i] * len(s)])
+        # dataset["token_type_ids_pad"].append([j for i, s in enumerate(sequence) for j in [i] * len(s)])
+        dataset["token_type_ids_pad"].append([j for i, s in enumerate(sequence) for j in [i % 2] * len(s)])
         dataset["lm_labels_pad"].append(([-1] * sum(len(s) for s in sequence[:-1])) + sequence[-1])
         # assert len(dataset["input_ids_pad"][-1]) == len(dataset["token_type_ids_pad"][-1]) == len(
         #    dataset["lm_labels_pad"][-1])
@@ -72,8 +73,9 @@ def build_one_json(session, eos, max_len):
         else:
             break
     dataset["input_ids_pad"].append(list(chain(*session)))
-    dataset["token_type_ids_pad"].append([j for i, s in enumerate(session) for j in [i] * len(s)])
-    #dataset["lm_labels_pad"].append(([-1] * sum(len(s) for s in sequence[:-1])) + sequence[-1])
+    # dataset["token_type_ids_pad"].append([j for i, s in enumerate(session) for j in [i] * len(s)])
+    dataset["token_type_ids_pad"].append([j for i, s in enumerate(session) for j in [i % 2] * len(s)])
+    # dataset["lm_labels_pad"].append(([-1] * sum(len(s) for s in sequence[:-1])) + sequence[-1])
     # assert len(dataset["input_ids_pad"][-1]) == len(dataset["token_type_ids_pad"][-1]) == len(
     #    dataset["lm_labels_pad"][-1])
     # dataset["all_ids"] = [i for i in range(len(dataset["lm_labels_pad"]))]

@@ -29,13 +29,12 @@ print('device:', device)
 parser = argparse.ArgumentParser()
 
 # data
-parser.add_argument("--dataset_path", type=str, default="data/Daily/daily_multi.json",
+parser.add_argument("--dataset_path", type=str, default="data/Daily/daily_tup.json",
                     help="Path or url of the dataset. If empty download accroding to dataset.")
 parser.add_argument("--dataset", type=str, default="Daily")
 parser.add_argument("--dataset_cache", type=str, default='./dataset_cache',
                     help="Path or url of the dataset cache")
 parser.add_argument("--save_dir", type=str, default="checkpoints")
-parser.add_argument("--outpath", type=str, default="result.txt")
 
 # model
 parser.add_argument("--model_checkpoint", type=str, default='pytorch_models/small_gpt2/',
@@ -80,6 +79,7 @@ parser.add_argument("--top_p", type=float, default=0.0,
                     help="Nucleus filtering (top-p) before sampling (<=0.0: no filtering)")
 parser.add_argument("--temperature", type=int, default=1,
                     help="Sampling softmax temperature")
+parser.add_argument("--outpath", type=str, default="result.txt")
 
 args = parser.parse_args()
 print(args)
@@ -121,7 +121,7 @@ def main():
         manager.pretrain_epoch()
         dev_ppl = manager.evaluate('dev')
         test_ppl = manager.evaluate('test')
-        manager.save()
+        manager.save(epoch)
 
         print('Pre-train Epoch {}, Dev PPL: {:.4f}, Test PPL: {:.4f}'.format(
             epoch, dev_ppl, test_ppl))
@@ -131,7 +131,7 @@ def main():
     for epoch in range(args.epochs):
         manager.train_epoch()
         dev_ppl = manager.evaluate('dev')
-        manager.save()
+        manager.save(epoch + args.pretrain_epochs)
 
         if epoch >= args.min_epochs:
             do_test = (dev_ppl < best_dev_ppl)
