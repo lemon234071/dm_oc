@@ -38,6 +38,7 @@ class LMManager:
         self.tokenizer = GPT2Tokenizer.from_pretrained(
             model_checkpoint, do_lower_case=True)
         self.pad_id = self.tokenizer.eos_token_id
+        self.use_segments = True
 
         self._config = GPT2Config.from_json_file(os.path.join(model_checkpoint, CONFIG_NAME))
         self._max_len = 256  # 512  # self._config.n_ctx
@@ -107,9 +108,11 @@ class LMManager:
         for step, batch in enumerate(tqdm(self._data_loader['train'],
                                           desc='Pre-training')):
             batch = tuple(t.to(self._device) for t in batch)
-            input_ids, segment_ids, label_ids, _ = batch
+            input_ids, token_type_ids, label_ids, _ = batch
+            if not self.use_segments:
+                token_type_ids = None
 
-            (loss), *_ = self._model(input_ids, token_type_ids=segment_ids, labels=label_ids)
+            (loss), *_ = self._model(input_ids, token_type_ids=token_type_ids, labels=label_ids)
             loss = loss / self.gradient_accumulation_steps
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self._model.parameters(), self.args.max_norm)
@@ -138,6 +141,8 @@ class LMManager:
             weights = self._norm_fn(weights)
             batch = tuple(t.to(self._device) for t in batch)
             input_ids, token_type_ids, label_ids, _ = batch
+            if not self.use_segments:
+                token_type_ids = None
 
             logits, *_ = self._model(input_ids, token_type_ids=token_type_ids)
             loss_original, non_padding = _compute_loss(logits, label_ids, criterion, label_shape=True)
@@ -187,8 +192,12 @@ class LMManager:
             # TODO(yida) why here compute loss outside the model ?
             # (loss), *_ = self._model(
             #     input_ids[i:i + 1], token_type_ids=segment_ids[i:i + 1], labels=label_ids[i:i + 1])
+            if not self.use_segments:
+                token_type_ids = None
+            else:
+                token_type_ids = segment_ids[i:i+1]
             logits, *_ = self._model(
-                input_ids[i:i + 1], token_type_ids=segment_ids[i:i + 1])
+                input_ids[i:i + 1], token_type_ids=token_type_ids)
             loss, _ = _compute_loss(logits, label_ids[i:i + 1], criterion)
 
             grads = torch.autograd.grad(
@@ -212,6 +221,8 @@ class LMManager:
             val_batch = (t.to(self._device) for t in val_batch)
             val_input_ids, val_segment_ids, val_label_ids, _ = \
                 val_batch
+            if not self.use_segments:
+                val_segment_ids = None
             val_batch_size = val_label_ids.shape[0]
 
             # L(theta'(phi))
@@ -247,10 +258,12 @@ class LMManager:
         for batch in tqdm(data_loader,
                           desc="Evaluating {} set".format(set_type)):
             batch = tuple(t.to(self._device) for t in batch)
-            input_ids, segment_ids, label_ids = batch[:3]
+            input_ids, token_type_ids, label_ids = batch[:3]
+            if not self.use_segments:
+                token_type_ids = None
 
             with torch.no_grad():
-                logits, *_ = self._model(input_ids, token_type_ids=segment_ids)
+                logits, *_ = self._model(input_ids, token_type_ids=token_type_ids)
                 loss, non_padding = _compute_loss(logits, label_ids, criterion)
                 total_loss += loss.item()
                 total_non_padding += non_padding
@@ -294,6 +307,9 @@ class LMManager:
         sys.stdout.flush()
 
     def infer(self, data, outpath, has_gt=True):
+        gt = [self.tokenizer.decode(session[-1], skip_special_tokens=True)
+              for session in data] if has_gt else None
+
         self._model.eval()
 
         predictions = []
@@ -306,23 +322,22 @@ class LMManager:
         with open(outpath, 'w', encoding="UTF-8") as f:
             f.write("\n".join(predictions))
 
-        gt = [self.tokenizer.decode(session[-1], skip_special_tokens=True)
-              for session in data] if has_gt else None
-        self._eval(predictions, gt)
+        if gt is not None:
+            self._eval(predictions, gt)
 
     def sample_sequence(self, session, has_gt, current_output=None):
-        if has_gt:
-            session = session[:-1]
         if current_output is None:
             current_output = []
+        if not has_gt:
+            session.append([])
 
         for i in range(self.args.max_length):
-            session.append(current_output)
+            session[-1] = current_output
             instance = build_one_json(session, self.tokenizer.eos_token_id, self._max_len)
             input_ids = torch.tensor(instance["input_ids_pad"],
                                      dtype=torch.long, device=self._device)
-            token_type_ids = torch.tensor(instance["token_type_ids_pad"],
-                                          dtype=torch.long, device=self._device)
+            token_type_ids = None if not self.use_segments else torch.tensor(
+                instance["token_type_ids_pad"], dtype=torch.long, device=self._device)
             logits, *_ = self._model(input_ids, token_type_ids=token_type_ids)
             logits = logits[0, -1, :] / self.args.temperature
             logits = top_filtering(logits, top_k=self.args.top_k, top_p=self.args.top_p)
