@@ -339,18 +339,18 @@ class LMManager:
 
     def _eval(self, hypts, refs):
         hypts = [line.strip().split() for line in hypts]
-        distinct = [round(x, 4) for x in eval_distinct(hypts)]
+        distinct = [round(x * 100, 4) for x in eval_distinct(hypts)]
         logger.info('distinct: {}'.format(distinct))
         if refs is not None:
             refs = [[line.strip().split()] for line in refs]
-            gold_distinct = [round(x, 4) for x in eval_distinct([x[0] for x in refs])]
+            gold_distinct = [round(x * 100, 4) for x in eval_distinct([x[0] for x in refs])]
             logger.info('gt distinct: {}'.format(gold_distinct))
             nltk_bleu = []
             chencherry = SmoothingFunction()
             for i in range(4):
                 weights = [1 / (i + 1)] * (i + 1)
                 nltk_bleu.append(
-                    round(corpus_bleu(
+                    round(100 * corpus_bleu(
                         refs, hypts, weights=weights, smoothing_function=chencherry.method1), 4))
             logger.info('nltk BLEU: {}'.format(nltk_bleu))
 
